@@ -93,21 +93,24 @@ export const defaultTheme: DashboardTheme = {
 export const darkTheme: DashboardTheme = {
   name: "dark",
   label: "Dark",
-  description: "Stable official dark theme",
+  description: "Dark flat rebuilt — no background artwork",
   palette: {
     background: { hex: "#0f1115", alpha: 1 },
     midground: { hex: "#f0ece4", alpha: 1 },
     foreground: { hex: "#ffffff", alpha: 0 },
-    warmGlow: "rgba(255, 255, 255, 0.08)",
-    noiseOpacity: 0.5,
+    warmGlow: "rgba(0, 0, 0, 0)",
+    noiseOpacity: 0,
   },
   typography: DEFAULT_TYPOGRAPHY,
-  layout: DEFAULT_LAYOUT,
+  layout: {
+    ...DEFAULT_LAYOUT,
+    radius: "0.35rem",
+  },
   colorOverrides: {
-    border: "#22252a",
-    muted: "#1a1d23",
+    border: "#262a31",
+    muted: "#13161b",
     mutedForeground: "#9ca3af",
-    card: "#16181d",
+    card: "#181b22",
   },
 };
 
