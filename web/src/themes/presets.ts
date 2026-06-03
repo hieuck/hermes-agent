@@ -38,6 +38,42 @@ const DEFAULT_LAYOUT: ThemeLayout = {
 // Themes
 // ---------------------------------------------------------------------------
 
+export const codexTheme: DashboardTheme = {
+  name: "codex",
+  label: "Codex",
+  description: "VS Code-like flat dark — JetBrains Mono, green accents",
+  palette: {
+    background: { hex: "#1e1e1e", alpha: 1 },
+    midground: { hex: "#cccccc", alpha: 1 },
+    foreground: { hex: "#ffffff", alpha: 0 },
+    warmGlow: "rgba(255, 255, 255, 0)",
+    noiseOpacity: 0,
+  },
+  typography: {
+    ...DEFAULT_TYPOGRAPHY,
+    fontSans: `"JetBrains Mono", ${SYSTEM_SANS}`,
+    fontMono: `"JetBrains Mono", ${SYSTEM_MONO}`,
+    fontUrl:
+      "https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap",
+    letterSpacing: "-0.005em",
+  },
+  layout: {
+    ...DEFAULT_LAYOUT,
+    radius: "0.5rem",
+    density: "comfortable",
+  },
+  colorOverrides: {
+    border: "#2a2a2a",
+    muted: "#252526",
+    mutedForeground: "#858585",
+    card: "#2d2d2d",
+  },
+  assets: {
+    bg: "none",
+  },
+  terminalBackground: "#1e1e1e",
+};
+
 export const defaultTheme: DashboardTheme = {
   name: "default",
   label: "Hermes Teal",
@@ -52,6 +88,43 @@ export const defaultTheme: DashboardTheme = {
   typography: DEFAULT_TYPOGRAPHY,
   layout: DEFAULT_LAYOUT,
   terminalBackground: "#000000",
+};
+
+export const darkTheme: DashboardTheme = {
+  name: "dark",
+  label: "Dark",
+  description: "Stable official dark theme",
+  palette: {
+    background: { hex: "#0f1115", alpha: 1 },
+    midground: { hex: "#f0ece4", alpha: 1 },
+    foreground: { hex: "#ffffff", alpha: 0 },
+    warmGlow: "rgba(255, 255, 255, 0.08)",
+    noiseOpacity: 0.5,
+  },
+  typography: DEFAULT_TYPOGRAPHY,
+  layout: DEFAULT_LAYOUT,
+  colorOverrides: {
+    border: "#22252a",
+    muted: "#1a1d23",
+    mutedForeground: "#9ca3af",
+    card: "#16181d",
+  },
+};
+
+export const darkLargeTheme: DashboardTheme = {
+  ...darkTheme,
+  name: "dark-large",
+  label: "Dark (Large)",
+  description: "Stable official dark theme, larger type and wider spacing",
+  typography: {
+    ...DEFAULT_TYPOGRAPHY,
+    baseSize: "17px",
+    lineHeight: "1.55",
+  },
+  layout: {
+    ...DEFAULT_LAYOUT,
+    density: "spacious",
+  },
 };
 
 export const midnightTheme: DashboardTheme = {
@@ -302,10 +375,13 @@ export const defaultLargeTheme: DashboardTheme = {
 export const BUILTIN_THEMES: Record<string, DashboardTheme> = {
   default: defaultTheme,
   "default-large": defaultLargeTheme,
+  dark: darkTheme,
+  "dark-large": darkLargeTheme,
   "nous-blue": nousBlueTheme,
   midnight: midnightTheme,
   ember: emberTheme,
   mono: monoTheme,
   cyberpunk: cyberpunkTheme,
   rose: roseTheme,
+  codex: codexTheme,
 };
