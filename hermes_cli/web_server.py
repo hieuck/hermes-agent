@@ -608,6 +608,12 @@ class ModelAssignment(BaseModel):
     provider: str
     model: str
     task: str = ""
+    # Optional OpenAI-compatible endpoint URL. Only honored for custom/local
+    # providers on the main slot — lets the GUI configure a self-hosted endpoint
+    # (vLLM, llama.cpp, Ollama, …) that needs no API key. The runtime resolver
+    # reads model.base_url from config (it ignores OPENAI_BASE_URL), so this is
+    # the path that actually wires a local endpoint into resolution.
+    base_url: str = ""
 
 
 _GATEWAY_HEALTH_URL = os.getenv("GATEWAY_HEALTH_URL")
@@ -1529,7 +1535,15 @@ async def get_sessions(
 
 @app.get("/api/sessions/search")
 async def search_sessions(q: str = "", limit: int = 20):
-    """Full-text search across session message content using FTS5."""
+    """Full-text search across session message content using FTS5.
+
+    Results are deduped by compression lineage, not by raw ``session_id``.
+    Auto-compression rotates a conversation onto a fresh session id (and leaves
+    the old segment's messages in the FTS index), so one logical chat can own
+    many ``sessions`` rows that all match the same query. Branches also use
+    ``parent_session_id``, but they are real alternate conversations; don't
+    collapse branch-specific hits back into the parent.
+    """
     if not q or not q.strip():
         return {"results": []}
     try:
@@ -1547,20 +1561,99 @@ async def search_sessions(q: str = "", limit: int = 20):
                 else:
                     terms.append(token + "*")
             prefix_query = " ".join(terms)
-            matches = db.search_messages(query=prefix_query, limit=limit)
-            # Group by session_id — return unique sessions with their best snippet
+            # Over-fetch so lineage dedup can still surface `limit` distinct
+            # conversations even when several hits collapse onto one root.
+            fetch_limit = max(limit * 5, 50)
+            matches = db.search_messages(query=prefix_query, limit=fetch_limit)
+
+            # Walk parent_session_id to the compression root, memoized so a
+            # chain of compression segments only costs one walk. We deliberately
+            # stop at branch/delegate edges: those sessions may diverge from the
+            # parent and should remain searchable on their own.
+            root_cache: dict = {}
+
+            def compression_root(session_id: str) -> str:
+                if not session_id:
+                    return session_id
+                if session_id in root_cache:
+                    return root_cache[session_id]
+                chain = []
+                cur = session_id
+                visited = set()
+                root = session_id
+                while cur and cur not in visited:
+                    visited.add(cur)
+                    chain.append(cur)
+                    if cur in root_cache:
+                        root = root_cache[cur]
+                        break
+                    try:
+                        s = db.get_session(cur)
+                    except Exception:
+                        s = None
+                    if not s:
+                        root = cur
+                        break
+                    parent = s.get("parent_session_id") if isinstance(s, dict) else None
+                    if not parent:
+                        root = cur
+                        break
+                    try:
+                        parent_session = db.get_session(parent)
+                    except Exception:
+                        parent_session = None
+                    if not parent_session:
+                        root = cur
+                        break
+                    parent_ended_at = parent_session.get("ended_at")
+                    started_at = s.get("started_at")
+                    is_compression_edge = (
+                        parent_session.get("end_reason") == "compression"
+                        and parent_ended_at is not None
+                        and started_at is not None
+                        and started_at >= parent_ended_at
+                    )
+                    if not is_compression_edge:
+                        root = cur
+                        break
+                    cur = parent
+                for node in chain:
+                    root_cache[node] = root
+                return root
+
+            tip_cache: dict = {}
+
+            def lineage_tip(root_id: str) -> str:
+                if root_id in tip_cache:
+                    return tip_cache[root_id]
+                tip = root_id
+                try:
+                    resolved = db.get_compression_tip(root_id)
+                    if resolved:
+                        tip = resolved
+                except Exception:
+                    pass
+                tip_cache[root_id] = tip
+                return tip
+
+            # Keep the best (first / most relevant) hit per compression root.
             seen: dict = {}
             for m in matches:
-                sid = m["session_id"]
-                if sid not in seen:
-                    seen[sid] = {
-                        "session_id": sid,
-                        "snippet": m.get("snippet", ""),
-                        "role": m.get("role"),
-                        "source": m.get("source"),
-                        "model": m.get("model"),
-                        "session_started": m.get("session_started"),
-                    }
+                raw_sid = m["session_id"]
+                root = compression_root(raw_sid)
+                if root in seen:
+                    continue
+                seen[root] = {
+                    "session_id": lineage_tip(root),
+                    "lineage_root": root,
+                    "snippet": m.get("snippet", ""),
+                    "role": m.get("role"),
+                    "source": m.get("source"),
+                    "model": m.get("model"),
+                    "session_started": m.get("session_started"),
+                }
+                if len(seen) >= limit:
+                    break
             return {"results": list(seen.values())}
         finally:
             db.close()
@@ -1867,6 +1960,7 @@ async def set_model_assignment(body: ModelAssignment):
     provider = (body.provider or "").strip()
     model = (body.model or "").strip()
     task = (body.task or "").strip().lower()
+    base_url = (body.base_url or "").strip()
 
     if scope not in {"main", "auxiliary"}:
         raise HTTPException(status_code=400, detail="scope must be 'main' or 'auxiliary'")
@@ -1882,8 +1976,14 @@ async def set_model_assignment(body: ModelAssignment):
                 model_cfg = {}
             model_cfg["provider"] = provider
             model_cfg["default"] = model
-            # Clear stale base_url so the resolver picks the provider's own default.
-            if "base_url" in model_cfg and model_cfg.get("base_url"):
+            # Custom/local providers are defined by their endpoint URL, so a
+            # base_url must be persisted here — the runtime resolver reads
+            # model.base_url from config and no longer consults OPENAI_BASE_URL.
+            # For every other provider, clear any stale base_url so the
+            # resolver picks the provider's own default endpoint.
+            if provider.strip().lower() == "custom" and base_url:
+                model_cfg["base_url"] = base_url
+            elif "base_url" in model_cfg and model_cfg.get("base_url"):
                 model_cfg["base_url"] = ""
             # Also clear hardcoded context_length override — new model may have
             # a different context window.
@@ -1926,6 +2026,7 @@ async def set_model_assignment(body: ModelAssignment):
                 "scope": "main",
                 "provider": provider,
                 "model": model,
+                "base_url": model_cfg.get("base_url", ""),
                 "gateway_tools": gateway_tools,
             }
 
@@ -2094,6 +2195,33 @@ _CREDENTIAL_PROBES: dict[str, tuple[str, str]] = {
 }
 
 
+def _parse_model_ids(resp: "Any") -> List[str]:
+    """Extract model ids from an OpenAI-compatible ``/v1/models`` response.
+
+    Tolerant of the common shapes: ``{"data": [{"id": ...}]}`` (OpenAI / vLLM /
+    llama.cpp) and a bare ``{"data": ["id", ...]}``. Returns ``[]`` on any
+    parse/HTTP error so a slightly non-standard endpoint never hard-blocks.
+    """
+    try:
+        if not resp.is_success:
+            return []
+        payload = resp.json()
+    except Exception:
+        return []
+    data = payload.get("data") if isinstance(payload, dict) else payload
+    if not isinstance(data, list):
+        return []
+    ids: List[str] = []
+    for item in data:
+        if isinstance(item, dict):
+            mid = str(item.get("id") or "").strip()
+        else:
+            mid = str(item or "").strip()
+        if mid:
+            ids.append(mid)
+    return ids
+
+
 @app.post("/api/providers/validate")
 async def validate_provider_credential(body: EnvVarUpdate, request: Request):
     """Live-probe a provider credential before it's saved.
@@ -2112,13 +2240,15 @@ async def validate_provider_credential(body: EnvVarUpdate, request: Request):
         return {"ok": False, "reachable": True, "message": "Enter a value first."}
 
     # Local / custom endpoint: validate connectivity, not auth — any HTTP
-    # response (even 401) proves the endpoint is up.
+    # response (even 401) proves the endpoint is up. Also surface the model
+    # ids the endpoint advertises (OpenAI ``/v1/models`` shape) so the GUI can
+    # auto-pick a default without asking the user to type a model name.
     if key == "OPENAI_BASE_URL":
         url = value.rstrip("/") + "/models"
         try:
             with httpx.Client(timeout=httpx.Timeout(8.0)) as client:
-                client.get(url)
-            return {"ok": True, "reachable": True, "message": ""}
+                resp = client.get(url)
+            return {"ok": True, "reachable": True, "message": "", "models": _parse_model_ids(resp)}
         except Exception:
             return {"ok": False, "reachable": False, "message": f"Could not reach {url}."}
 
@@ -3013,22 +3143,6 @@ def _claude_code_only_status() -> Dict[str, Any]:
 # to a third-party CLI like Claude Code or Qwen).
 _OAUTH_PROVIDER_CATALOG: tuple[Dict[str, Any], ...] = (
     {
-        "id": "anthropic",
-        "name": "Anthropic (Claude API)",
-        "flow": "pkce",
-        "cli_command": "hermes auth add anthropic",
-        "docs_url": "https://docs.claude.com/en/api/getting-started",
-        "status_fn": _anthropic_oauth_status,
-    },
-    {
-        "id": "claude-code",
-        "name": "Claude Code (subscription)",
-        "flow": "external",
-        "cli_command": "claude setup-token",
-        "docs_url": "https://docs.claude.com/en/docs/claude-code",
-        "status_fn": _claude_code_only_status,
-    },
-    {
         "id": "nous",
         "name": "Nous Portal",
         "flow": "device_code",
@@ -3038,7 +3152,7 @@ _OAUTH_PROVIDER_CATALOG: tuple[Dict[str, Any], ...] = (
     },
     {
         "id": "openai-codex",
-        "name": "OpenAI Codex (ChatGPT)",
+        "name": "OpenAI OAuth (ChatGPT)",
         "flow": "device_code",
         "cli_command": "hermes auth add openai-codex",
         "docs_url": "https://platform.openai.com/docs",
@@ -3075,6 +3189,25 @@ _OAUTH_PROVIDER_CATALOG: tuple[Dict[str, Any], ...] = (
         "cli_command": "hermes auth add xai-oauth",
         "docs_url": "https://hermes-agent.nousresearch.com/docs/guides/xai-grok-oauth",
         "status_fn": None,  # dispatched via auth.get_xai_oauth_auth_status
+    },
+    # ── Anthropic / Claude entries sit at the bottom: the API-key path
+    # first, then the subscription OAuth path (which only works with extra
+    # usage credits on top of a Claude Max plan — see disclaimer in name).
+    {
+        "id": "anthropic",
+        "name": "Anthropic API Key",
+        "flow": "pkce",
+        "cli_command": "hermes auth add anthropic",
+        "docs_url": "https://docs.claude.com/en/api/getting-started",
+        "status_fn": _anthropic_oauth_status,
+    },
+    {
+        "id": "claude-code",
+        "name": "Anthropic OAuth: Required Extra Usage Credits to Use Subscription",
+        "flow": "external",
+        "cli_command": "claude setup-token",
+        "docs_url": "https://docs.claude.com/en/docs/claude-code",
+        "status_fn": _claude_code_only_status,
     },
 )
 
